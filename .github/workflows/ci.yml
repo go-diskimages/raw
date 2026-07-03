@@ -1,0 +1,91 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  COVERAGE_MIN: "100.0"
+
+jobs:
+  native:
+    name: native ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: test
+        env:
+          CGO_ENABLED: "0"
+        run: go test -cover -coverprofile=cover.out ./...
+      - name: coverage gate
+        run: |
+          total=$(go tool cover -func=cover.out | awk '/^total:/ {gsub("%","",$3); print $3}')
+          echo "total coverage: ${total}%"
+          awk -v t="$total" -v m="$COVERAGE_MIN" 'BEGIN { if (t+0 < m+0) { printf "coverage %.1f%% below minimum %.1f%%\n", t, m; exit 1 } }'
+
+  emulated:
+    name: emulated ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            image: debian:trixie
+            qemu_cpu: rv64,v=true,vlen=128
+          - arch: loong64
+            image: ghcr.io/loong64/debian:trixie
+            qemu_cpu: la464
+          - arch: ppc64le
+            image: debian:trixie
+            qemu_cpu: power9
+          - arch: s390x
+            image: debian:trixie
+            qemu_cpu: qemu
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: register binfmt handlers
+        run: docker run --rm --privileged tonistiigi/binfmt --install all
+      - name: cross-compile test binaries
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p testbins
+          for pkg in $(go list ./...); do
+            name=$(echo "$pkg" | tr '/' '_')
+            go test -c -cover -o "testbins/${name}.test" "$pkg"
+          done
+      - name: run test binaries under qemu
+        run: |
+          set -e
+          for bin in testbins/*.test; do
+            [ -f "$bin" ] || continue
+            echo "=== running $bin on ${{ matrix.arch }} ==="
+            docker run --rm \
+              --platform "linux/${{ matrix.arch }}" \
+              -e QEMU_CPU='${{ matrix.qemu_cpu }}' \
+              -v "$PWD:/work" -w /work \
+              "${{ matrix.image }}" \
+              "/work/$bin" -test.v
+          done
